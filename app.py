@@ -1,6 +1,10 @@
 import os
 import sys
+import re
+import json
+import hashlib
 from pathlib import Path
+from collections import Counter
 # ── GPU / CUDA path fix ────────────────────────────────────────────────────────
 # Fix CUDA_PATH if it's incorrectly set to the bin directory instead of the root.
 # llama-cpp-python expects CUDA_PATH to point to the CUDA installation root,
@@ -45,12 +49,20 @@ HF_API_TIMEOUT    = int(os.getenv("HF_API_TIMEOUT", "45"))
 HF_INFERENCE_TASK  = os.getenv("HF_INFERENCE_TASK", "conversational").strip() or "conversational"
 LOCAL_LLM_PATH    = os.getenv("LOCAL_LLM_PATH",    "models/phi-2.Q4_K_M.gguf")
 RETRIEVER_K       = int(os.getenv("RETRIEVER_K",   "3"))
+RETRIEVER_FETCH_K = int(os.getenv("RETRIEVER_FETCH_K", str(max(RETRIEVER_K * 4, 12))))
+PAGE_INDEX_TOP_K  = int(os.getenv("PAGE_INDEX_TOP_K", "6"))
+HYBRID_ALPHA      = float(os.getenv("HYBRID_ALPHA", "0.65"))
+CHUNK_SIZE        = int(os.getenv("CHUNK_SIZE", "600"))
+CHUNK_OVERLAP     = int(os.getenv("CHUNK_OVERLAP", "120"))
 HF_INFERENCE_FALLBACKS = [
     model.strip() for model in os.getenv("HF_INFERENCE_FALLBACKS", "").split(",") if model.strip()
 ]
 HF_INFERENCE_TASK_FALLBACKS = [
     task.strip() for task in os.getenv("HF_INFERENCE_TASK_FALLBACKS", "text-generation,conversational").split(",") if task.strip()
 ]
+
+VECTORSTORE_MANIFEST_FILE = "manifest.json"
+PAGE_INDEX_FILE = "page_index.json"
 
 # GPU layers: how many transformer layers to offload to GPU.
 # For GTX 1650 4 GB with Phi-2 Q4_K_M (~1.7 GB) → all 32 layers fit.
@@ -139,6 +151,8 @@ from langchain_classic.chains import create_history_aware_retriever, create_retr
 from langchain_classic.chains.combine_documents import create_stuff_documents_chain
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.messages import HumanMessage, AIMessage
+from langchain_core.documents import Document
+from langchain_core.retrievers import BaseRetriever
 
 from huggingface_hub import InferenceClient
 from langchain_core.language_models.llms import LLM
@@ -353,6 +367,49 @@ def _discover_vectorstore_paths():
     return candidates
 
 
+def _normalize_page_text(text: str) -> str:
+    cleaned = (text or "").replace("\x00", " ")
+    cleaned = re.sub(r"\s+", " ", cleaned)
+    return cleaned.strip()
+
+
+def _tokenize_for_index(text: str) -> Counter:
+    tokens = re.findall(r"[a-zA-Z][a-zA-Z0-9\-]{1,}", (text or "").lower())
+    return Counter(tokens)
+
+
+def _pdf_manifest(pdf_paths: list[Path]) -> list[dict]:
+    manifest = []
+    for pdf in sorted(pdf_paths):
+        stat = pdf.stat()
+        fingerprint = hashlib.sha256(
+            f"{pdf.name}:{stat.st_size}:{int(stat.st_mtime)}".encode("utf-8")
+        ).hexdigest()[:16]
+        manifest.append({
+            "name": pdf.name,
+            "size": stat.st_size,
+            "mtime": int(stat.st_mtime),
+            "fingerprint": fingerprint,
+        })
+    return manifest
+
+
+def _load_json(path: Path):
+    if not path.exists():
+        return None
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def _save_json(path: Path, payload: dict):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False)
+
+
 def _build_fallback_vectorstore(embeddings, reason: str):
     """Build a minimal fallback vectorstore so the app can still start."""
     fallback_text = (
@@ -370,12 +427,7 @@ def _build_fallback_vectorstore(embeddings, reason: str):
 @st.cache_resource(show_spinner="📚 Loading knowledge base…")
 def _load_vectorstore_internal():
     """
-    Internal vectorstore loader without Streamlit UI calls.
-    Returns: (vector_store, source, error_message, build_info)
-    - vector_store: FAISS vector store or None if failed
-    - source: "cached" or "built"
-    - error_message: Error string if failed, None otherwise
-    - build_info: Dict with build progress details for UI display
+    Returns: (vector_store, page_index, source, error_message, build_info)
     """
     embeddings = HuggingFaceEmbeddings(
         model_name=EMBEDDING_MODEL,
@@ -383,9 +435,10 @@ def _load_vectorstore_internal():
         encode_kwargs={"normalize_embeddings": True, "batch_size": 64},
     )
 
-    # ── Load cached index ─────────────────────────────────────────────────────
-    candidate_store_paths = _discover_vectorstore_paths()
+    pdf_paths = sorted(Path(PDF_DATA_PATH).glob("*.pdf")) if os.path.isdir(PDF_DATA_PATH) else []
+    current_manifest = _pdf_manifest(pdf_paths)
 
+    candidate_store_paths = _discover_vectorstore_paths()
     cached_load_error = None
     for store_path in candidate_store_paths:
         try:
@@ -393,14 +446,18 @@ def _load_vectorstore_internal():
             if not store_dir.exists() or not store_dir.is_dir():
                 continue
 
-            # Prefer default LangChain naming first.
+            manifest_payload = _load_json(store_dir / VECTORSTORE_MANIFEST_FILE)
+            if manifest_payload and manifest_payload.get("pdf_manifest") != current_manifest:
+                continue
+
+            page_index_payload = _load_json(store_dir / PAGE_INDEX_FILE)
+
             if (store_dir / "index.faiss").exists() and (store_dir / "index.pkl").exists():
                 vector_store = FAISS.load_local(
                     str(store_dir), embeddings, allow_dangerous_deserialization=True
                 )
-                return vector_store, "cached", None, None
+                return vector_store, page_index_payload, "cached", None, None
 
-            # Fallback: support custom stem names like my_store.faiss/my_store.pkl.
             for faiss_file in store_dir.glob("*.faiss"):
                 stem = faiss_file.stem
                 if not (store_dir / f"{stem}.pkl").exists():
@@ -411,15 +468,13 @@ def _load_vectorstore_internal():
                     index_name=stem,
                     allow_dangerous_deserialization=True,
                 )
-                return vector_store, "cached", None, None
+                return vector_store, page_index_payload, "cached", None, None
         except Exception as exc:
             cached_load_error = (
                 f"Found cached index artifacts in `{store_path}` but failed to load: {exc}"
             )
-    # ── Build from PDFs ───────────────────────────────────────────────────────
-    if not os.path.isdir(PDF_DATA_PATH) or not any(
-        f.lower().endswith(".pdf") for f in os.listdir(PDF_DATA_PATH)
-    ):
+
+    if not pdf_paths:
         error_msg = (
             f"No PDF files found in `{PDF_DATA_PATH}`. "
             "Please add at least one PDF to the data directory."
@@ -428,20 +483,36 @@ def _load_vectorstore_internal():
             error_msg = f"{cached_load_error}. {error_msg}"
         error_msg += f" Checked vectorstore paths: {', '.join(candidate_store_paths)}"
         fallback_store = _build_fallback_vectorstore(embeddings, error_msg)
-        return fallback_store, "fallback", error_msg, {"fallback": True}
+        return fallback_store, None, "fallback", error_msg, {"fallback": True}
 
-    # Build vectorstore and collect progress info
-    pdf_paths = sorted(Path(PDF_DATA_PATH).glob("*.pdf"))
     documents = []
     skipped_pdfs = []
+    page_index_rows = []
 
     for pdf_path in pdf_paths:
         try:
             file_docs = PyPDFLoader(str(pdf_path)).load()
-            if file_docs:
-                documents.extend(file_docs)
-            else:
+            if not file_docs:
                 skipped_pdfs.append(f"{pdf_path.name} (no extractable pages)")
+                continue
+
+            for d in file_docs:
+                cleaned_text = _normalize_page_text(d.page_content)
+                if len(cleaned_text) < 40:
+                    continue
+                d.page_content = cleaned_text
+                d.metadata["source"] = str(pdf_path)
+                d.metadata["source_file"] = pdf_path.name
+                documents.append(d)
+                page_index_rows.append(
+                    {
+                        "source": str(pdf_path),
+                        "source_file": pdf_path.name,
+                        "page": int(d.metadata.get("page", 0)),
+                        "content": cleaned_text,
+                        "term_freq": dict(_tokenize_for_index(cleaned_text).most_common(120)),
+                    }
+                )
         except Exception as exc:
             skipped_pdfs.append(f"{pdf_path.name} ({exc})")
 
@@ -464,21 +535,30 @@ def _load_vectorstore_internal():
             "skipped_pdfs": skipped_pdfs,
             "fallback": True,
         }
-        return fallback_store, "fallback", error_msg, build_info
+        return fallback_store, None, "fallback", error_msg, build_info
 
     num_pages = len(documents)
     num_pdfs = len(set(d.metadata.get('source', '') for d in documents))
 
     splitter = RecursiveCharacterTextSplitter(
-        chunk_size=600,
-        chunk_overlap=120,
+        chunk_size=CHUNK_SIZE,
+        chunk_overlap=CHUNK_OVERLAP,
         add_start_index=True,
+        separators=["\n\n", "\n", ". ", " ", ""],
     )
     chunks = splitter.split_documents(documents)
     num_chunks = len(chunks)
 
     vector_store = FAISS.from_documents(chunks, embeddings)
     vector_store.save_local(VECTOR_STORE_PATH)
+
+    page_index_payload = {
+        "version": 1,
+        "rows": page_index_rows,
+        "pdf_manifest": current_manifest,
+    }
+    _save_json(Path(VECTOR_STORE_PATH) / PAGE_INDEX_FILE, page_index_payload)
+    _save_json(Path(VECTOR_STORE_PATH) / VECTORSTORE_MANIFEST_FILE, {"pdf_manifest": current_manifest})
 
     build_info = {
         "num_pages": num_pages,
@@ -488,7 +568,7 @@ def _load_vectorstore_internal():
         "skipped_pdfs": skipped_pdfs,
     }
 
-    return vector_store, "built", None, build_info
+    return vector_store, page_index_payload, "built", None, build_info
 
 
 def load_vectorstore():
@@ -497,7 +577,7 @@ def load_vectorstore():
     Load FAISS index from disk (fast), or build it from PDFs on first run.
     Embeddings run on GPU if available, otherwise CPU.
     """
-    vector_store, source, error, build_info = _load_vectorstore_internal()
+    vector_store, page_index, source, error, build_info = _load_vectorstore_internal()
     
     # Handle errors with UI feedback
     if error:
@@ -522,14 +602,90 @@ def load_vectorstore():
             st.write("✅ Vector store saved to disk")
             status.update(label="✅ Knowledge base ready!", state="complete")
     
-    return vector_store, source
+    return vector_store, page_index, source
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Initialise resources (cached — only runs once per session)
 # ─────────────────────────────────────────────────────────────────────────────
-llm, llm_source         = load_llm()
-vector_store, vs_source = load_vectorstore()
+llm, llm_source = load_llm()
+vector_store, page_index, vs_source = load_vectorstore()
+
+class HybridPageRetriever(BaseRetriever):
+    """Combines FAISS semantic retrieval with lightweight page-level lexical retrieval."""
+
+    vector_store: any
+    page_index: dict | None = None
+    k: int = RETRIEVER_K
+    fetch_k: int = RETRIEVER_FETCH_K
+    lexical_k: int = PAGE_INDEX_TOP_K
+    alpha: float = HYBRID_ALPHA
+
+    def _page_hits(self, query: str) -> list[Document]:
+        if not self.page_index or not self.page_index.get("rows"):
+            return []
+
+        query_terms = _tokenize_for_index(query)
+        if not query_terms:
+            return []
+
+        scored = []
+        for row in self.page_index["rows"]:
+            term_freq = row.get("term_freq", {})
+            score = sum(query_terms[t] * term_freq.get(t, 0) for t in query_terms)
+            if score <= 0:
+                continue
+            scored.append((score, row))
+
+        scored.sort(key=lambda x: x[0], reverse=True)
+        docs = []
+        for score, row in scored[: self.lexical_k]:
+            docs.append(
+                Document(
+                    page_content=row.get("content", ""),
+                    metadata={
+                        "source": row.get("source", "unknown"),
+                        "source_file": row.get("source_file", "unknown"),
+                        "page": row.get("page", 0),
+                        "retrieval_score": score,
+                        "retrieval_method": "page-index",
+                    },
+                )
+            )
+        return docs
+
+    def _get_relevant_documents(self, query: str, *, run_manager=None) -> list[Document]:
+        semantic_docs = self.vector_store.max_marginal_relevance_search(
+            query,
+            k=self.k,
+            fetch_k=self.fetch_k,
+        )
+        lexical_docs = self._page_hits(query)
+
+        merged = {}
+        for rank, doc in enumerate(semantic_docs):
+            key = (doc.metadata.get("source", "unknown"), doc.metadata.get("page", 0), doc.page_content[:120])
+            merged[key] = {
+                "doc": doc,
+                "semantic": max(0.0, 1.0 - (rank / max(1, self.fetch_k))),
+                "lexical": 0.0,
+            }
+
+        for rank, doc in enumerate(lexical_docs):
+            key = (doc.metadata.get("source", "unknown"), doc.metadata.get("page", 0), doc.page_content[:120])
+            lexical_score = max(0.0, 1.0 - (rank / max(1, self.lexical_k)))
+            if key in merged:
+                merged[key]["lexical"] = max(merged[key]["lexical"], lexical_score)
+            else:
+                merged[key] = {"doc": doc, "semantic": 0.0, "lexical": lexical_score}
+
+        ranked = sorted(
+            merged.values(),
+            key=lambda item: self.alpha * item["semantic"] + (1 - self.alpha) * item["lexical"],
+            reverse=True,
+        )
+        return [item["doc"] for item in ranked[: self.k]]
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # RAG chain construction
@@ -562,9 +718,13 @@ _QA_PROMPT = ChatPromptTemplate.from_messages([
     ("human", "{input}"),
 ])
 
-retriever = vector_store.as_retriever(
-    search_type="mmr",
-    search_kwargs={"k": RETRIEVER_K, "fetch_k": RETRIEVER_K * 4},
+retriever = HybridPageRetriever(
+    vector_store=vector_store,
+    page_index=page_index,
+    k=RETRIEVER_K,
+    fetch_k=RETRIEVER_FETCH_K,
+    lexical_k=PAGE_INDEX_TOP_K,
+    alpha=HYBRID_ALPHA,
 )
 
 history_aware_retriever = create_history_aware_retriever(llm, retriever, _CONTEXTUALIZE_PROMPT)
@@ -685,7 +845,7 @@ with st.sidebar:
     )
 
     st.caption(f"Model: `{EMBEDDING_MODEL.split('/')[-1]}`")
-    st.caption(f"Retriever: MMR, k={RETRIEVER_K}")
+    st.caption(f"Retriever: Hybrid (FAISS + Page Index), k={RETRIEVER_K}, fetch_k={RETRIEVER_FETCH_K}")
 
     st.divider()
 

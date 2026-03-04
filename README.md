@@ -1,6 +1,6 @@
 ---
 license: mit
-title: Healthcarre-Assistant-Chatbot
+title: Healthcare-Assistant-Chatbot
 sdk: docker
 emoji: 🏃
 ---
@@ -21,9 +21,32 @@ An AI-powered medical chatbot built with **Retrieval-Augmented Generation (RAG)*
 | 🧠 **Conversational Memory** | Multi-turn chat with context-aware follow-up questions |
 | ☁️ **Cloud + Local LLM** | HuggingFace Inference API with automatic fallback to local GGUF |
 | 📄 **Source Attribution** | Every answer shows exact PDF pages it was drawn from |
-| 🎯 **MMR Retrieval** | Maximal Marginal Relevance for diverse, non-redundant context |
+| 🎯 **Hybrid Retrieval** | FAISS semantic search + lightweight page index for faster/high-recall retrieval |
 | 🖥️ **Modern UI** | Clean Streamlit interface with status badges and controls |
 | 🐳 **Docker Ready** | One-command deployment to any cloud platform |
+
+---
+
+## ⚙️ Retrieval Quality & Speed (Production Defaults)
+
+This app now uses a **hybrid retriever**:
+
+1. **FAISS semantic search** over chunk embeddings (great for paraphrased queries)
+2. **Page index lexical search** (very fast exact-term matching at page level)
+3. **Weighted merge** of both signals for final context selection
+
+This improves PDF grounding, especially for medical terms and drug names that can be missed by vector-only retrieval.
+
+### Key Environment Variables
+
+- `RETRIEVER_K` (default `3`) – final docs sent to LLM
+- `RETRIEVER_FETCH_K` (default `max(RETRIEVER_K*4,12)`) – FAISS candidate pool
+- `PAGE_INDEX_TOP_K` (default `6`) – lexical page candidates
+- `HYBRID_ALPHA` (default `0.65`) – weighting between semantic and lexical scores
+- `CHUNK_SIZE` (default `600`)
+- `CHUNK_OVERLAP` (default `120`)
+
+The vector store now persists a PDF manifest, and auto-rebuilds when files change so adding more PDFs is straightforward.
 
 ---
 
@@ -268,5 +291,7 @@ MIT License — feel free to use, modify, and distribute.
 
 - [LangChain](https://github.com/langchain-ai/langchain) for the RAG framework
 - [llama.cpp](https://github.com/ggerganov/llama.cpp) for efficient local inference
-- [HuggingFace](https://huggingface.co/) for model hosting and inference API#   h e a l t h c a r e - d e b  
+- [HuggingFace](https://huggingface.co/) for model hosting and inference API#   h e a l t h c a r e - d e b 
+ 
+ 
  
