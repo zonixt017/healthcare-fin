@@ -50,5 +50,5 @@ EXPOSE 7860 8501
 HEALTHCHECK --interval=30s --timeout=10s --start-period=120s --retries=3 \
     CMD curl --fail "http://localhost:${PORT:-7860}/_stcore/health" || exit 1
 
-# ── Run Streamlit ─────────────────────────────────────────────────────────────
-CMD ["./start.sh"]
+# ── Run Streamlit directly (avoid shell/shebang line-ending pitfalls) ─────────
+CMD ["streamlit", "run", "app.py", "--server.port=7860", "--server.address=0.0.0.0", "--server.headless=true", "--server.enableCORS=false", "--server.enableXsrfProtection=true"]
