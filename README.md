@@ -19,7 +19,7 @@ An AI-powered medical chatbot built with **Retrieval-Augmented Generation (RAG)*
 | 🚀 **GPU Accelerated** | Runs on GTX 1650 (4GB VRAM) with CUDA offloading for fast inference |
 | 🔍 **RAG Pipeline** | Answers grounded in retrieved documents — no hallucination |
 | 🧠 **Conversational Memory** | Multi-turn chat with context-aware follow-up questions |
-| ☁️ **Cloud + Local LLM** | HuggingFace Inference API with automatic fallback to local GGUF |
+| ☁️ **Cloud-First LLM** | OpenRouter free models by default, optional HuggingFace fallback |
 | 📄 **Source Attribution** | Every answer shows exact PDF pages it was drawn from |
 | 🎯 **Hybrid Retrieval** | FAISS semantic search + lightweight page index for faster/high-recall retrieval |
 | 🖥️ **Modern UI** | Clean Streamlit interface with status badges and controls |
@@ -75,8 +75,8 @@ User Question
       ▼
 ┌─────────────────────────────────────────────────────────┐
 │                        LLM                               │
-│  ☁️ HuggingFace Inference API (Mistral-7B)             │
-│  🚀 Local GGUF + GPU (Phi-2 / TinyLlama / Mistral)     │
+│  ☁️ OpenRouter API (free chat models)                  │
+│  ☁️ Optional HuggingFace fallback                        │
 └─────────────────────────────────────────────────────────┘
       │
       ▼
@@ -118,11 +118,14 @@ pip install -r requirements.txt
 cp .env.example .env
 ```
 
-Edit `.env` and add your HuggingFace token (free at https://huggingface.co/settings/tokens):
+Edit `.env` and add your OpenRouter API key (https://openrouter.ai/keys):
 
 ```env
-HUGGINGFACEHUB_API_TOKEN=hf_your_token_here
+OPENROUTER_API_KEY=sk-or-your-key
+# aliases also supported: OPENROUTER_KEY / OR_API_KEY / OPENAI_API_KEY
 ```
+
+You can optionally add `HUGGINGFACEHUB_API_TOKEN` as a secondary cloud fallback.
 
 ### 3. Add PDF Knowledge Base
 
@@ -191,9 +194,12 @@ All settings in `.env`:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `HUGGINGFACEHUB_API_TOKEN` | *(none)* | HF token for cloud inference |
-| `HF_INFERENCE_API` | `mistralai/Mistral-7B-Instruct-v0.2` | Cloud model ID |
-| `LOCAL_LLM_PATH` | `models/phi-2.Q4_K_M.gguf` | Local GGUF model path |
+| `OPENROUTER_API_KEY` | *(none)* | Primary cloud token (recommended) |
+| `OPENROUTER_MODEL` | `meta-llama/llama-3.1-8b-instruct:free` | Primary OpenRouter model ID |
+| `HUGGINGFACEHUB_API_TOKEN` | *(none)* | Optional HF fallback token |
+| `HF_INFERENCE_API` | `Qwen/Qwen2.5-7B-Instruct` | Primary HF fallback model |
+| `ALLOW_LOCAL_LLM_FALLBACK` | `false` | Enable GGUF fallback only if needed |
+| `LOCAL_LLM_PATH` | `models/phi-2.Q4_K_M.gguf` | Local GGUF path (optional) |
 | `N_GPU_LAYERS` | `32` | GPU layers to offload (0 = CPU) |
 | `PDF_DATA_PATH` | `data/` | PDF directory |
 | `VECTOR_STORE_PATH` | `vectorstore` | FAISS index location |
@@ -221,7 +227,7 @@ All settings in `.env`:
 2. Go to [huggingface.co/new-space](https://huggingface.co/new-space)
 3. Select **Docker** as SDK
 4. Upload your code or connect GitHub repo
-5. Add secret: `HUGGINGFACEHUB_API_TOKEN` = your_token
+5. Add secret: `OPENROUTER_API_KEY` = your_key (or alias `OPENAI_API_KEY`), plus optional `HUGGINGFACEHUB_API_TOKEN`
 6. Deploy! Your app will be at `username-healthcare-assistant.hf.space`
 
 ### Alternative Platforms
@@ -275,8 +281,8 @@ This project includes ready-to-use configuration files:
 | Orchestration | [LangChain](https://python.langchain.com/) |
 | Embeddings | [sentence-transformers](https://huggingface.co/sentence-transformers) |
 | Vector Store | [FAISS](https://github.com/facebookresearch/faiss) |
-| Cloud LLM | [HuggingFace Inference API](https://huggingface.co/inference-api) |
-| Local LLM | [llama-cpp-python](https://github.com/abetlen/llama-cpp-python) |
+| Cloud LLM | [OpenRouter](https://openrouter.ai/) + optional [HuggingFace Inference API](https://huggingface.co/inference-api) |
+| Local LLM | [llama-cpp-python](https://github.com/abetlen/llama-cpp-python) (optional fallback) |
 | PDF Parsing | [pypdf](https://pypdf.readthedocs.io/) |
 
 ---
@@ -291,7 +297,6 @@ MIT License — feel free to use, modify, and distribute.
 
 - [LangChain](https://github.com/langchain-ai/langchain) for the RAG framework
 - [llama.cpp](https://github.com/ggerganov/llama.cpp) for efficient local inference
-- [HuggingFace](https://huggingface.co/) for model hosting and inference API#   h e a l t h c a r e - d e b 
- 
- 
- 
+- [HuggingFace](https://huggingface.co/) for model hosting and inference API# healthcare-deb
+
+

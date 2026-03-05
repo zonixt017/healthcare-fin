@@ -5,6 +5,7 @@ import json
 import hashlib
 from pathlib import Path
 from collections import Counter
+from urllib import request, error
 # ── GPU / CUDA path fix ────────────────────────────────────────────────────────
 # Fix CUDA_PATH if it's incorrectly set to the bin directory instead of the root.
 # llama-cpp-python expects CUDA_PATH to point to the CUDA installation root,
@@ -44,9 +45,16 @@ load_dotenv()
 PDF_DATA_PATH     = os.getenv("PDF_DATA_PATH",     "data/")
 VECTOR_STORE_PATH = os.getenv("VECTOR_STORE_PATH", "vectorstore")
 EMBEDDING_MODEL   = os.getenv("EMBEDDING_MODEL",   "sentence-transformers/all-MiniLM-L6-v2")
-HF_INFERENCE_API  = os.getenv("HF_INFERENCE_API",  "mistralai/Mistral-7B-Instruct-v0.2")
+HF_INFERENCE_API  = os.getenv("HF_INFERENCE_API",  "Qwen/Qwen2.5-7B-Instruct")
 HF_API_TIMEOUT    = int(os.getenv("HF_API_TIMEOUT", "45"))
 HF_INFERENCE_TASK  = os.getenv("HF_INFERENCE_TASK", "conversational").strip() or "conversational"
+OPENROUTER_BASE_URL = os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1").rstrip("/")
+OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "meta-llama/llama-3.1-8b-instruct:free").strip()
+OPENROUTER_FALLBACKS = [
+    model.strip() for model in os.getenv("OPENROUTER_FALLBACKS", "google/gemma-2-9b-it:free,mistralai/mistral-7b-instruct:free").split(",") if model.strip()
+]
+OPENROUTER_TIMEOUT = int(os.getenv("OPENROUTER_TIMEOUT", str(HF_API_TIMEOUT)))
+ALLOW_LOCAL_LLM_FALLBACK = os.getenv("ALLOW_LOCAL_LLM_FALLBACK", "false").lower() in {"1", "true", "yes", "on"}
 LOCAL_LLM_PATH    = os.getenv("LOCAL_LLM_PATH",    "models/phi-2.Q4_K_M.gguf")
 RETRIEVER_K       = int(os.getenv("RETRIEVER_K",   "3"))
 RETRIEVER_FETCH_K = int(os.getenv("RETRIEVER_FETCH_K", str(max(RETRIEVER_K * 4, 12))))
@@ -55,7 +63,12 @@ HYBRID_ALPHA      = float(os.getenv("HYBRID_ALPHA", "0.65"))
 CHUNK_SIZE        = int(os.getenv("CHUNK_SIZE", "600"))
 CHUNK_OVERLAP     = int(os.getenv("CHUNK_OVERLAP", "120"))
 HF_INFERENCE_FALLBACKS = [
-    model.strip() for model in os.getenv("HF_INFERENCE_FALLBACKS", "").split(",") if model.strip()
+    model.strip()
+    for model in os.getenv(
+        "HF_INFERENCE_FALLBACKS",
+        "HuggingFaceH4/zephyr-7b-beta,microsoft/Phi-3-mini-4k-instruct,TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+    ).split(",")
+    if model.strip()
 ]
 HF_INFERENCE_TASK_FALLBACKS = [
     task.strip() for task in os.getenv("HF_INFERENCE_TASK_FALLBACKS", "text-generation,conversational").split(",") if task.strip()
@@ -158,6 +171,68 @@ from huggingface_hub import InferenceClient
 from langchain_core.language_models.llms import LLM
 
 
+class OpenRouterLLM(LLM):
+    """LangChain-compatible wrapper for OpenRouter chat completions."""
+
+    model_id: str
+    api_key: str
+    timeout: float
+    base_url: str = OPENROUTER_BASE_URL
+    temperature: float = 0.2
+    max_new_tokens: int = 512
+
+    @property
+    def _llm_type(self) -> str:
+        return "openrouter-chat"
+
+    def _call(self, prompt: str, stop=None, run_manager=None, **kwargs) -> str:
+        payload = {
+            "model": self.model_id,
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": self.temperature,
+            "max_tokens": self.max_new_tokens,
+        }
+        req = request.Request(
+            f"{self.base_url}/chat/completions",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={
+                "Authorization": f"Bearer {self.api_key}",
+                "Content-Type": "application/json",
+                "HTTP-Referer": os.getenv("OPENROUTER_SITE_URL", "https://huggingface.co/spaces"),
+                "X-Title": os.getenv("OPENROUTER_APP_NAME", "Healthcare Assistant Chatbot"),
+            },
+            method="POST",
+        )
+
+        try:
+            with request.urlopen(req, timeout=self.timeout) as resp:
+                body = json.loads(resp.read().decode("utf-8"))
+        except error.HTTPError as exc:
+            details = exc.read().decode("utf-8", errors="ignore")
+            raise RuntimeError(f"OpenRouter HTTP {exc.code}: {details[:240]}") from exc
+        except error.URLError as exc:
+            raise RuntimeError(f"OpenRouter network error: {exc.reason}") from exc
+
+        choices = body.get("choices") or []
+        message = choices[0].get("message", {}) if choices else {}
+        content = message.get("content", "")
+        if isinstance(content, list):
+            text = "".join(
+                part.get("text", "") if isinstance(part, dict) else str(part)
+                for part in content
+            )
+        else:
+            text = str(content)
+
+        if stop:
+            for token in stop:
+                if token and token in text:
+                    text = text.split(token)[0]
+                    break
+
+        return text.strip()
+
+
 class HFInferenceLLM(LLM):
     """Minimal LangChain-compatible wrapper around huggingface_hub InferenceClient."""
 
@@ -198,6 +273,16 @@ class HFInferenceLLM(LLM):
         return text
 
 
+def _resolve_openrouter_key() -> str:
+    """Resolve OpenRouter key from common secret names."""
+    return (
+        os.getenv("OPENROUTER_API_KEY", "").strip()
+        or os.getenv("OPENROUTER_KEY", "").strip()
+        or os.getenv("OR_API_KEY", "").strip()
+        or os.getenv("OPENAI_API_KEY", "").strip()
+    )
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # LLM loader (no Streamlit UI calls inside cached function)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -211,18 +296,37 @@ def _load_llm_internal():
     - error_message: Error string if failed, None otherwise
     - gpu_info: Dict with GPU details for toast notification
     """
+    openrouter_key = _resolve_openrouter_key()
     hf_token = (
         os.getenv("HUGGINGFACEHUB_API_TOKEN", "").strip()
         or os.getenv("HF_TOKEN", "").strip()
         or os.getenv("HUGGINGFACE_API_TOKEN", "").strip()
     )
-    cloud_error = None
 
-    # ── 1. Cloud API ──────────────────────────────────────────────────────────
+    cloud_errors = []
+
+    # ── 1. OpenRouter Cloud API (preferred) ───────────────────────────────────
+    if openrouter_key:
+        candidate_models = [OPENROUTER_MODEL, *[m for m in OPENROUTER_FALLBACKS if m != OPENROUTER_MODEL]]
+        for model_id in candidate_models:
+            try:
+                llm = OpenRouterLLM(
+                    model_id=model_id,
+                    api_key=openrouter_key,
+                    timeout=OPENROUTER_TIMEOUT,
+                    temperature=0.2,
+                    max_new_tokens=512,
+                )
+                llm.invoke("Reply with exactly: ok")
+                mode = "cloud-openrouter" if model_id == OPENROUTER_MODEL else f"cloud-openrouter-fallback({model_id})"
+                return llm, mode, None, None
+            except Exception as exc:
+                cloud_errors.append(f"openrouter:{model_id}: {type(exc).__name__}")
+
+    # ── 2. Hugging Face Cloud API (optional fallback) ─────────────────────────
     if hf_token:
         candidate_models = [HF_INFERENCE_API, *HF_INFERENCE_FALLBACKS]
         candidate_tasks = [HF_INFERENCE_TASK, *[t for t in HF_INFERENCE_TASK_FALLBACKS if t != HF_INFERENCE_TASK]]
-        cloud_errors = []
 
         for model_id in candidate_models:
             for task_name in candidate_tasks:
@@ -235,39 +339,44 @@ def _load_llm_internal():
                         temperature=0.3,
                         max_new_tokens=512,
                     )
-                    llm.invoke("Reply with exactly: ok")  # quick connectivity check
-                    if model_id == HF_INFERENCE_API and task_name == HF_INFERENCE_TASK:
-                        mode = "cloud"
-                    else:
-                        mode = f"cloud-fallback({model_id}|{task_name})"
+                    llm.invoke("Reply with exactly: ok")
+                    mode = "cloud-hf" if (model_id == HF_INFERENCE_API and task_name == HF_INFERENCE_TASK) else f"cloud-hf-fallback({model_id}|{task_name})"
                     return llm, mode, None, None
-                except Exception as e:
-                    cloud_errors.append(f"{model_id}|{task_name}: {type(e).__name__}")
+                except Exception as exc:
+                    cloud_errors.append(f"hf:{model_id}|{task_name}: {type(exc).__name__}")
 
+    cloud_error = "Cloud API unavailable."
+    if cloud_errors:
         cloud_error = f"Cloud API unavailable ({'; '.join(cloud_errors)})"
 
-    # ── 2. Local GGUF (GPU-accelerated) ──────────────────────────────────────
+    if not ALLOW_LOCAL_LLM_FALLBACK:
+        if not openrouter_key and not hf_token:
+            msg = (
+                "No cloud LLM credentials found. Add at least one secret: "
+                "`OPENROUTER_API_KEY` (recommended) or `HUGGINGFACEHUB_API_TOKEN`/`HF_TOKEN`."
+            )
+        elif hf_token and not openrouter_key:
+            msg = (
+                "Hugging Face token is present, but no configured HF model/task could be called. "
+                "Try `HF_INFERENCE_API=Qwen/Qwen2.5-7B-Instruct` and keep fallback models enabled. "
+                "You can also set `OPENROUTER_API_KEY` for a more reliable cloud path."
+            )
+        elif openrouter_key and not hf_token:
+            msg = (
+                "OpenRouter key is present, but all configured OpenRouter models failed. "
+                "Try updating `OPENROUTER_MODEL` / `OPENROUTER_FALLBACKS` to currently available `:free` models."
+            )
+        else:
+            msg = "No cloud LLM is currently available with the provided credentials/model configuration."
+
+        return None, None, f"{msg}\n\nAttempt detail: {cloud_error}", None
+
+    # ── 3. Local GGUF (optional fallback) ─────────────────────────────────────
     if not os.path.exists(LOCAL_LLM_PATH):
-        cloud_hint = (
-            f"\n\nCloud attempt detail: {cloud_error}. "
-            "Check your Hugging Face token and verify `HF_INFERENCE_API` points to a model "
-            "available for Inference API/serverless calls."
-            if cloud_error else ""
-        )
-        error_msg = (
-            f"Local model not found at `{LOCAL_LLM_PATH}`.\n\n"
-            "**Quick fix:** Download a GGUF model and update `LOCAL_LLM_PATH` in your `.env`.\n\n"
-            "Recommended for your GTX 1650 (4 GB VRAM):\n"
-            "- `phi-2.Q4_K_M.gguf` — best quality/speed balance (~1.7 GB)\n"
-            "- `tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf` — fastest (~0.7 GB)\n\n"
-            "See `WIFI_SETUP_GUIDE.md` for download links.\n\n"
-            "Tip: on Hugging Face Spaces, add one of these secrets:\n"
-            "- `HUGGINGFACEHUB_API_TOKEN` (preferred)\n"
-            "- `HF_TOKEN`\n"
-            "- `HUGGINGFACE_API_TOKEN`"
-            + cloud_hint
-        )
-        return None, None, error_msg, None
+        return None, None, (
+            f"Cloud LLM failed and local fallback is enabled, but no local model exists at `{LOCAL_LLM_PATH}`. "
+            "Either disable `ALLOW_LOCAL_LLM_FALLBACK` or provide a GGUF file."
+        ), None
 
     try:
         from langchain_community.llms import LlamaCpp
@@ -310,8 +419,9 @@ def load_llm():
     """
     Wrapper that handles UI feedback for LLM loading.
     Priority order:
-      1. HuggingFace Inference API (cloud) — if token is set and reachable
-      2. Local GGUF via LlamaCpp with GPU offloading — fastest local option
+      1. OpenRouter (cloud, recommended)
+      2. Hugging Face Inference API (cloud fallback)
+      3. Local GGUF via LlamaCpp (optional, only when ALLOW_LOCAL_LLM_FALLBACK=true)
     """
     llm, mode, error, gpu_info = _load_llm_internal()
     
@@ -780,12 +890,17 @@ def _build_lc_history(messages: list) -> list:
 
 
 def _llm_mode_label(source: str) -> str:
-    if source == "cloud":
+    if source == "cloud-openrouter":
+        return "☁️ Cloud (OpenRouter)"
+    if source.startswith("cloud-openrouter-fallback("):
+        model = source[len("cloud-openrouter-fallback("):-1]
+        return f"☁️ OpenRouter fallback ({model})"
+    if source == "cloud-hf":
         return "☁️ Cloud (HuggingFace)"
-    if source.startswith("cloud-fallback("):
-        value = source[len("cloud-fallback("):-1]
+    if source.startswith("cloud-hf-fallback("):
+        value = source[len("cloud-hf-fallback("):-1]
         model, task = value.split("|", 1) if "|" in value else (value, "unknown-task")
-        return f"☁️ Cloud fallback ({model}, {task})"
+        return f"☁️ HF fallback ({model}, {task})"
     if source.startswith("local-gpu"):
         layers = source.split("(")[1].rstrip("L)") if "(" in source else "?"
         return f"🚀 Local GPU ({layers} layers offloaded)"
