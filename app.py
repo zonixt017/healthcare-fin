@@ -114,14 +114,14 @@ st.markdown("""
 <style>
 /* ── General ── */
 [data-testid="stAppViewContainer"] { background: #f8fafc; }
-[data-testid="stSidebar"]          { background: #1e293b; }
+[data-testid="stSidebar"]          { background: linear-gradient(180deg, #0f172a 0%, #1e293b 100%); }
 [data-testid="stSidebar"] *        { color: #e2e8f0 !important; }
 [data-testid="stSidebar"] .stButton > button {
-    background: #334155; border: 1px solid #475569;
+    background: #1f2937; border: 1px solid #334155;
     color: #e2e8f0; border-radius: 8px;
 }
 [data-testid="stSidebar"] .stButton > button:hover {
-    background: #ef4444; border-color: #ef4444; color: white;
+    background: #dc2626; border-color: #ef4444; color: white;
 }
 
 /* ── Chat messages ── */
@@ -137,16 +137,26 @@ h1 { color: #0f172a !important; }
 /* ── Status badges ── */
 .status-badge {
     display: inline-block;
-    padding: 2px 10px;
+    padding: 4px 11px;
     border-radius: 999px;
-    font-size: 0.78rem;
-    font-weight: 600;
-    margin: 2px 0;
+    font-size: 0.8rem;
+    font-weight: 700;
+    margin: 4px 0;
+    border: 1px solid transparent;
 }
-.badge-green  { background:#dcfce7; color:#166534; }
-.badge-blue   { background:#dbeafe; color:#1e40af; }
-.badge-yellow { background:#fef9c3; color:#854d0e; }
-.badge-red    { background:#fee2e2; color:#991b1b; }
+.badge-green  { background:#14532d; color:#dcfce7; border-color:#166534; }
+.badge-blue   { background:#1e3a8a; color:#dbeafe; border-color:#1d4ed8; }
+.badge-yellow { background:#78350f; color:#fef9c3; border-color:#a16207; }
+.badge-red    { background:#7f1d1d; color:#fee2e2; border-color:#b91c1c; }
+
+.status-label {
+    font-size: 0.79rem;
+    color: #bfdbfe !important;
+    margin-top: 8px;
+    margin-bottom: 2px;
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+}
 
 /* ── Source expander ── */
 [data-testid="stExpander"] { border: 1px solid #e2e8f0; border-radius: 8px; }
@@ -907,6 +917,25 @@ def _llm_mode_label(source: str) -> str:
     return "💻 Local CPU"
 
 
+def _active_llm_model(source: str) -> str:
+    if source == "cloud-openrouter":
+        return OPENROUTER_MODEL
+    if source.startswith("cloud-openrouter-fallback("):
+        return source[len("cloud-openrouter-fallback("):-1]
+    if source == "cloud-hf":
+        return HF_INFERENCE_API
+    if source.startswith("cloud-hf-fallback("):
+        value = source[len("cloud-hf-fallback("):-1]
+        return value.split("|", 1)[0]
+    if source.startswith("local-gpu") or source == "local-cpu":
+        return os.path.basename(LOCAL_LLM_PATH)
+    return "unknown"
+
+
+def _embedding_model_name() -> str:
+    return EMBEDDING_MODEL.split("/")[-1]
+
+
 def _render_sources(sources: list):
     if not sources:
         return
@@ -937,29 +966,34 @@ with st.sidebar:
     st.subheader("🔧 System Status")
 
     llm_label = _llm_mode_label(llm_source)
+    active_llm_model = _active_llm_model(llm_source)
     badge_cls = "badge-green" if "GPU" in llm_label or "Cloud" in llm_label else "badge-yellow"
+    st.markdown('<div class="status-label">🧠 Generation LLM</div>', unsafe_allow_html=True)
     st.markdown(
-        f'<span class="status-badge {badge_cls}">LLM: {llm_label}</span>',
+        f'<span class="status-badge {badge_cls}">{llm_label}</span>',
         unsafe_allow_html=True,
     )
+    st.caption(f"Model: `{active_llm_model}`")
+
     if vs_source == "cached":
         vs_label = "📦 Cached"
     elif vs_source == "fallback":
         vs_label = "⚠️ Fallback"
     else:
         vs_label = "🔨 Freshly built"
+    st.markdown('<div class="status-label">📚 Knowledge Base</div>', unsafe_allow_html=True)
     st.markdown(
-        f'<span class="status-badge badge-blue">KB: {vs_label}</span>',
+        f'<span class="status-badge badge-blue">{vs_label}</span>',
         unsafe_allow_html=True,
     )
 
     embed_badge = "badge-green" if EMBED_DEVICE == "cuda" else "badge-blue"
+    st.markdown('<div class="status-label">🧩 Embedding Setup</div>', unsafe_allow_html=True)
     st.markdown(
-        f'<span class="status-badge {embed_badge}">Embeddings: {EMBED_DEVICE.upper()}</span>',
+        f'<span class="status-badge {embed_badge}">Device: {EMBED_DEVICE.upper()}</span>',
         unsafe_allow_html=True,
     )
-
-    st.caption(f"Model: `{EMBEDDING_MODEL.split('/')[-1]}`")
+    st.caption(f"Embedding model: `{_embedding_model_name()}`")
     st.caption(f"Retriever: Hybrid (FAISS + Page Index), k={RETRIEVER_K}, fetch_k={RETRIEVER_FETCH_K}")
 
     st.divider()
